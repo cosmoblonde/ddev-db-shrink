@@ -13,3 +13,7 @@ trim_trailing_whitespace = false
 
 [*.{bats,sh,yml,yaml}]
 indent_size = 2
+
+# commands have no file extension
+[commands/host/*]
+indent_size = 2
