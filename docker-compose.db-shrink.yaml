@@ -1,8 +1,8 @@
 #ddev-generated
 services:
-  addon-template:
-    container_name: ddev-${DDEV_SITENAME}-addon-template
-    image: ${ADDON_TEMPLATE_DOCKER_IMAGE:-ddev/ddev-utilities:latest}
+  db-shrink:
+    container_name: ddev-${DDEV_SITENAME}-db-shrink
+    image: ${DB_SHRINK_DOCKER_IMAGE:-ddev/ddev-utilities:latest}
     command: ["sh", "-c", "trap exit TERM; sleep infinity & wait"]
     restart: "no"
     # These labels ensure this service is discoverable by DDEV.
