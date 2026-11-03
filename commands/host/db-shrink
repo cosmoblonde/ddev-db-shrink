@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+#ddev-generated
+## Description: Shrink the database volume: dump all databases, recreate the volume, reimport (asks first)
+## Usage: db-shrink [--dry-run] [--dir=<path>] [--exclude="<db> ..."] [--confirm=<project>] [--delete-dumps]
+## Example: ddev db-shrink --dry-run
+
+# InnoDB never gives space back to the file system (ibdata1, undo logs, tables that were filled and emptied again),
+# only a fresh volume does. Steps: dump every database, check the dumps, remove the volume, start the project,
+# reimport, compare table and routine counts. Nothing is removed before all dumps are complete and checked.
+# Runs on the host and stays compatible with bash 3.2 (macOS).
+
+set -o nounset -o pipefail
+# Git Bash on Windows would rewrite container paths like /var/lib/mysql
+export MSYS_NO_PATHCONV=1
+
+usage() {
+  cat <<'EOF'
+Usage: ddev db-shrink [options]
+
+Shrinks the database volume of this project: dumps every database, removes the volume,
+starts the project with a fresh one and reimports the dumps. Shows the plan and asks
+for the project name before anything is changed. MariaDB and MySQL only.
+
+  --dry-run            show the plan only, change nothing
+  --dir=<path>         where the dumps go (default ~/ddev-db-shrink/<project>/<time>);
+                       keep it outside the project, or Mutagen syncs the dumps again
+  --exclude="<db> ..." databases not to restore; they are gone afterwards
+  --confirm=<project>  confirm without a question, for scripts
+  --delete-dumps       delete the dumps after a successful reimport (default: ask, or keep)
+EOF
+}
+
+# set once the volume is gone: from then on every error prints how to restore the dumps
+volume_removed=false
+dump_dir=""
+
+die() {
+  echo "db-shrink: $*" >&2
+  if [[ "$volume_removed" == true ]]; then
+    echo "" >&2
+    echo "The old volume is removed. The dumps are complete and kept in $dump_dir" >&2
+    echo "Restore them with the commands in $dump_dir/restore.txt" >&2
+  fi
+  exit 1
+}
+
+# kB -> human readable
+human() {
+  awk -v k="$1" 'BEGIN { split("kB MB GB TB", u); i = 1; while (k >= 1024 && i < 4) { k /= 1024; i++ } printf (i == 1 ? "%d %s" : "%.1f %s"), k, u[i] }'
+}
+
+in_list() {
+  case " $2 " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+dry_run=false
+dump_root="$HOME/ddev-db-shrink"
+exclude=""
+confirm=""
+delete_dumps=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=true ;;
+    --dir=*) dump_root=${arg#--dir=} ;;
+    --exclude=*) exclude=${arg#--exclude=} ;;
+    --confirm=*) confirm=${arg#--confirm=} ;;
+    --delete-dumps) delete_dumps=true ;;
+    -h | --help | help) usage; exit 0 ;;
+    *) usage >&2; die "unknown option $arg" ;;
+  esac
+done
+
+[[ -n "${DDEV_SITENAME:-}" ]] || die "run it as \"ddev db-shrink\" inside a project"
+command -v docker >/dev/null || die "docker not found"
+command -v gzip >/dev/null || die "gzip not found"
+
+project=$DDEV_SITENAME
+db_container="ddev-$project-db"
+
+if [[ "$(docker inspect -f '{{.State.Running}}' "$db_container" 2>/dev/null)" != "true" ]]; then
+  echo "Starting the project to read the databases ..."
+  ddev start --skip-hooks || die "ddev start failed"
+fi
+
+# the volume name is read from the container, not guessed
+mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Type}} {{.Name}}{{end}}{{end}}' "$db_container")
+[[ -n "$mount" ]] || die "no /var/lib/mysql in $db_container: only MariaDB and MySQL are supported"
+[[ "${mount%% *}" == volume ]] || die "/var/lib/mysql in $db_container is no Docker volume ($mount)"
+volume=${mount#* }
+[[ "$volume" == *"$project"* ]] || die "volume $volume does not look like the volume of $project, stopping"
+
+client=$(docker exec "$db_container" sh -c 'command -v mariadb || command -v mysql') || die "no mysql client in $db_container"
+dumper=$(docker exec "$db_container" sh -c 'command -v mariadb-dump || command -v mysqldump') || die "no mysqldump in $db_container"
+
+# root/root is the DDEV default inside the db container; MYSQL_PWD keeps it off the command line.
+# sql takes no stdin, so it does not eat the input of the while loops below; sql_import reads the dump from stdin.
+sql() {
+  docker exec -e MYSQL_PWD=root "$db_container" "$client" -uroot -N -B "$@" </dev/null
+}
+sql_import() {
+  docker exec -i -e MYSQL_PWD=root "$db_container" "$client" -uroot "$1"
+}
+
+# name, charset, collation, data size in kB, tables (incl. views), routines and events
+read_databases() {
+  sql -e "SELECT s.schema_name, s.default_character_set_name, s.default_collation_name,
+      COALESCE(ROUND(SUM(t.data_length + t.index_length) / 1024), 0), COUNT(t.table_name),
+      (SELECT COUNT(*) FROM information_schema.routines r WHERE r.routine_schema = s.schema_name)
+        + (SELECT COUNT(*) FROM information_schema.events e WHERE e.event_schema = s.schema_name)
+    FROM information_schema.schemata s
+    LEFT JOIN information_schema.tables t ON t.table_schema = s.schema_name
+    WHERE s.schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys')
+    GROUP BY s.schema_name, s.default_character_set_name, s.default_collation_name
+    ORDER BY s.schema_name"
+}
+
+databases_before=$(read_databases) || die "could not read the databases"
+[[ -n "$databases_before" ]] || die "no databases found"
+
+names=""
+# names end up in SQL and file names
+name_pattern='^[A-Za-z0-9_$-]+$'
+while read -r name _; do
+  [[ "$name" =~ $name_pattern ]] || die "database name \"$name\" contains unsupported characters"
+  names="$names $name"
+done <<< "$databases_before"
+
+for name in $exclude; do
+  in_list "$name" "$names" || die "--exclude: there is no database $name"
+done
+
+# users other than the DDEV defaults do not survive a fresh volume
+other_users=$(sql -e "SELECT CONCAT(user, '@', host) FROM mysql.user
+    WHERE user NOT IN ('root', 'db', 'mysql', 'mariadb.sys', 'healthcheck', 'mysql.sys', 'mysql.session', 'mysql.infoschema', '')" 2>/dev/null | tr '\n' ' ')
+
+volume_kb=$(docker exec -u root "$db_container" du -sk /var/lib/mysql 2>/dev/null | cut -f1)
+
+dump_root=${dump_root/#\~/$HOME}
+[[ "$dump_root" == /* ]] || dump_root="$PWD/$dump_root"
+dump_dir="$dump_root/$project/$(date +%Y%m%d-%H%M%S)"
+free_dir=$dump_root
+while [[ ! -d "$free_dir" ]]; do free_dir=$(dirname "$free_dir"); done
+free_kb=$(df -Pk "$free_dir" | awk 'NR == 2 { print $4 }')
+
+data_kb=0
+echo ""
+echo "Project    $project"
+echo "Volume     $volume, $(human "$volume_kb") on disk"
+echo "Databases"
+while read -r name _ _ size tables routines; do
+  line=$(printf '  %-24s %10s  %5s tables' "$name" "$(human "$size")" "$tables")
+  (( routines > 0 )) && line="$line, $routines routines/events"
+  if in_list "$name" "$exclude"; then
+    line="$line  EXCLUDED: gone afterwards"
+  else
+    data_kb=$(( data_kb + size ))
+  fi
+  echo "$line"
+done <<< "$databases_before"
+# compressed SQL dumps are usually far smaller than the data; a quarter is on the safe side
+need_kb=$(( data_kb / 4 ))
+echo "Dumps      $dump_dir"
+echo "           free $(human "$free_kb"), needs about $(human "$need_kb")"
+echo "Expected   the volume shrinks to roughly the data size ($(human "$data_kb"))"
+[[ -n "${other_users// /}" ]] && echo "Warning    these database users are lost: $other_users"
+echo "Note       the project restarts without post-start hooks; \"ddev restart\" runs them later"
+echo ""
+
+(( free_kb > need_kb )) || die "not enough free space for the dumps, choose another place with --dir"
+
+if [[ "$dry_run" == true ]]; then
+  echo "Dry run, nothing changed."
+  exit 0
+fi
+
+if [[ -n "$confirm" ]]; then
+  [[ "$confirm" == "$project" ]] || die "--confirm=$confirm does not match the project name $project, nothing changed"
+elif [[ -t 0 ]]; then
+  read -r -p "Type the project name to remove the volume and reimport ($project): " answer
+  [[ "$answer" == "$project" ]] || die "aborted, nothing changed"
+else
+  die "no terminal to ask: pass --confirm=$project, nothing changed"
+fi
+
+mkdir -p "$dump_dir" || die "cannot create $dump_dir"
+echo "$databases_before" > "$dump_dir/databases.txt"
+: > "$dump_dir/restore.txt"
+
+# 1. dump and check every database; any problem stops here, before anything is removed
+while read -r name charset collation _; do
+  in_list "$name" "$exclude" && continue
+  file="$dump_dir/$name.sql.gz"
+  echo "Dumping $name ..."
+  docker exec -e MYSQL_PWD=root "$db_container" "$dumper" -uroot --single-transaction --quick --routines --events \
+    --triggers --hex-blob --default-character-set=utf8mb4 "$name" | gzip > "$file" \
+    || die "dump of $name failed, nothing removed; dumps so far in $dump_dir"
+  gzip -t "$file" 2>/dev/null || die "dump of $name is damaged, nothing removed"
+  # mysqldump ends a complete dump with this comment
+  gzip -cd "$file" | tail -n 1 | grep -q '^-- Dump completed' || die "dump of $name is incomplete, nothing removed"
+  echo "ddev import-db --database=$name --file=\"$file\"" >> "$dump_dir/restore.txt"
+done <<< "$databases_before"
+echo "All dumps complete: $dump_dir"
+
+# 2. fresh volume
+ddev stop || die "ddev stop failed, nothing removed; \"ddev start\" brings the project back"
+docker volume rm "$volume" >/dev/null || die "could not remove $volume, nothing lost; \"ddev start\" brings the project back"
+volume_removed=true
+ddev start --skip-hooks || die "ddev start failed"
+
+# 3. reimport with the original charset and collation
+while read -r name charset collation _; do
+  in_list "$name" "$exclude" && continue
+  echo "Importing $name ..."
+  sql -e "CREATE DATABASE IF NOT EXISTS \`$name\` CHARACTER SET $charset COLLATE $collation;
+      ALTER DATABASE \`$name\` CHARACTER SET $charset COLLATE $collation" || die "could not create $name"
+  gzip -cd "$dump_dir/$name.sql.gz" | sql_import "$name" || die "import of $name failed"
+done <<< "$databases_before"
+
+# 4. compare with the state before
+databases_after=$(read_databases) || die "could not read the databases after the import"
+while read -r name _ _ _ tables routines; do
+  in_list "$name" "$exclude" && continue
+  after=$(awk -v n="$name" '$1 == n { print $5, $6 }' <<< "$databases_after")
+  [[ "$after" == "$tables $routines" ]] || die "$name has \"${after:-nothing}\" tables/routines after the import, expected \"$tables $routines\""
+done <<< "$databases_before"
+
+after_kb=$(docker exec -u root "$db_container" du -sk /var/lib/mysql 2>/dev/null | cut -f1)
+echo ""
+echo "Done: $volume $(human "$volume_kb") -> $(human "$after_kb"), all tables and routines are back."
+echo "Docker Desktop may report the freed space with some delay."
+
+# 5. the dumps
+if [[ "$delete_dumps" == true ]]; then
+  rm -rf "$dump_dir" && echo "Dumps deleted."
+elif [[ -t 0 && -z "$confirm" ]]; then
+  read -r -p "Delete the dumps in $dump_dir? [y/N] " answer
+  if [[ "$answer" == y || "$answer" == Y ]]; then
+    rm -rf "$dump_dir" && echo "Dumps deleted."
+  else
+    echo "Dumps kept in $dump_dir"
+  fi
+else
+  echo "Dumps kept in $dump_dir"
+fi
