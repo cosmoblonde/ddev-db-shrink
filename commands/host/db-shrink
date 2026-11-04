@@ -208,21 +208,27 @@ docker volume rm "$volume" >/dev/null || die "could not remove $volume, nothing 
 volume_removed=true
 ddev start --skip-hooks || die "ddev start failed"
 
-# 3. reimport with the original charset and collation
+# 3. reimport with the original charset and collation; a fresh volume only grants the user db the database db,
+# so the others need the same grant "ddev import-db" gives them
 while read -r name charset collation _; do
   in_list "$name" "$exclude" && continue
   echo "Importing $name ..."
   sql -e "CREATE DATABASE IF NOT EXISTS \`$name\` CHARACTER SET $charset COLLATE $collation;
-      ALTER DATABASE \`$name\` CHARACTER SET $charset COLLATE $collation" || die "could not create $name"
+      ALTER DATABASE \`$name\` CHARACTER SET $charset COLLATE $collation;
+      GRANT ALL ON \`$name\`.* TO 'db'@'%'" || die "could not create $name"
   gzip -cd "$dump_dir/$name.sql.gz" | sql_import "$name" || die "import of $name failed"
 done <<< "$databases_before"
 
-# 4. compare with the state before
+# 4. compare with the state before, also from the side of the user db the site connects with
 databases_after=$(read_databases) || die "could not read the databases after the import"
+# -p on purpose: the client options in the container hold the root password and win over MYSQL_PWD
+visible=$(docker exec "$db_container" "$client" -udb -pdb -N -B -e "SHOW DATABASES" </dev/null | tr '\n' ' ') \
+  || die "could not read the databases as user db"
 while read -r name _ _ _ tables routines; do
   in_list "$name" "$exclude" && continue
   after=$(awk -v n="$name" '$1 == n { print $5, $6 }' <<< "$databases_after")
   [[ "$after" == "$tables $routines" ]] || die "$name has \"${after:-nothing}\" tables/routines after the import, expected \"$tables $routines\""
+  in_list "$name" "$visible" || die "$name is back, but the user db cannot see it"
 done <<< "$databases_before"
 
 after_kb=$(docker exec -u root "$db_container" du -sk /var/lib/mysql 2>/dev/null | cut -f1)

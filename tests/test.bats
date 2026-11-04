@@ -168,6 +168,14 @@ teardown() {
   run ddev mysql -N -B -e "SHOW DATABASES LIKE 'old_import'"
   assert_output ""
 
+  # "ddev mysql" is root, the site connects as db: a fresh volume only grants it the database db
+  run ddev mysql -udb -pdb -N -B -e "SELECT COUNT(*) FROM second.t"
+  assert_success
+  assert_output "3"
+  run ddev mysql -udb -pdb -N -B -e "SELECT second.answer()"
+  assert_success
+  assert_output "42"
+
   # dumps and restore commands are kept
   dumps=$(ls -d "${TESTDIR}/dumps/${PROJNAME}"/*)
   assert_file_exist "${dumps}/db.sql.gz"
