@@ -90,6 +90,8 @@ options (routines, events) and the original collation of each database are under
 ## Limits
 
 * Database users other than the DDEV defaults (`root`, `db`) do not survive; the plan lists them.
+* The user `db` gets all privileges on every restored database, the same grant `ddev import-db` gives. Other grants do
+  not survive.
 * Post-start hooks are skipped on the restart, so hooks that write to the database do not run against an empty one.
   `ddev restart` runs them afterwards.
 * Docker Desktop on macOS may report the freed space with some delay.
